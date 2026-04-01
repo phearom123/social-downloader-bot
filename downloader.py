@@ -1,90 +1,41 @@
+import yt_dlp
 import os
 import re
-from urllib.parse import urlparse
-import yt_dlp
 
-def detect_platform(url: str) -> str:
-    host = (urlparse(url).netloc or "").lower()
-    mapping = {
-        "tiktok": "TikTok",
-        "instagram": "Instagram",
-        "facebook": "Facebook",
-        "fb.watch": "Facebook",
-        "youtu": "YouTube",
-        "youtube": "YouTube",
-        "twitter": "X",
-        "x.com": "X",
-        "threads": "Threads",
-        "pinterest": "Pinterest",
-        "snapchat": "Snapchat",
-    }
-    for k, v in mapping.items():
-        if k in host:
-            return v
-    return host or "Unknown"
+class SocialDownloader:
+    def __init__(self):
+        self.tmp = "downloads"
+        if not os.path.exists(self.tmp): os.makedirs(self.tmp)
 
-def safe_filename(name: str) -> str:
-    name = name or "download"
-    name = re.sub(r'[\\/:*?"<>|\n\r\t]+', "_", name)
-    return name[:120].strip(" ._") or "download"
+    def is_supported(self, url):
+        supported = ['tiktok.com', 'instagram.com', 'facebook.com', 'youtube.com', 'youtu.be', 'twitter.com', 'x.com']
+        return any(x in url for x in supported)
 
-def extract_info(url: str):
-    opts = {"quiet": True, "skip_download": True, "noplaylist": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return info
+    def get_info(self, url):
+        with yt_dlp.YoutubeDL({'quiet': True, 'noplaylist': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return {
+                'title': info.get('title', 'Video'),
+                'platform': info.get('extractor_key', 'Social'),
+                'duration': info.get('duration', 0)
+            }
 
-def download_media(url: str, output_dir: str, ytdlp_format: str = "bv*+ba/b"):
-    os.makedirs(output_dir, exist_ok=True)
-    info = extract_info(url)
-    title = safe_filename(info.get("title") or "download")
-    outtmpl = os.path.join(output_dir, f"{title}.%(ext)s")
+    def download(self, url, uid, mtype='video'):
+        path = os.path.join(self.tmp, f"{uid}_{mtype}.%(ext)s")
+        ydl_opts = {
+            'outtmpl': path,
+            'format': 'best' if mtype == 'video' else 'bestaudio/best',
+            'quiet': True,
+        }
+        if mtype == 'audio':
+            ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}]
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            fpath = ydl.prepare_filename(info)
+            if mtype == 'audio': fpath = fpath.rsplit('.', 1)[0] + '.mp3'
+            return {'path': fpath, 'platform': info.get('extractor_key'), 'title': info.get('title')}
 
-    # choose type
-    requested = info.get("requested_downloads") or []
-    entries = info.get("entries")
-    media_type = "video"
-    if info.get("_type") == "playlist" and entries:
-        # keep first entry only for simplicity
-        info = entries[0]
-    ext = info.get("ext")
-
-    if not info.get("vcodec") or info.get("vcodec") == "none":
-        if info.get("thumbnails") or info.get("ext") in {"jpg", "jpeg", "png", "webp"}:
-            media_type = "image"
-        else:
-            media_type = "video"
-
-    opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "outtmpl": outtmpl,
-        "format": ytdlp_format,
-        "merge_output_format": "mp4",
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.extract_info(url, download=True)
-
-    # locate file
-    file_path = None
-    for name in os.listdir(output_dir):
-        if name.startswith(title + "."):
-            file_path = os.path.join(output_dir, name)
-            break
-    if not file_path:
-        # fallback: latest file
-        files = [os.path.join(output_dir, f) for f in os.listdir(output_dir)]
-        if files:
-            file_path = max(files, key=os.path.getmtime)
-
-    caption = info.get("description") or info.get("caption") or info.get("title") or ""
-    platform = detect_platform(url)
-    return {
-        "platform": platform,
-        "media_type": media_type,
-        "caption": caption,
-        "file_path": file_path,
-        "local_file_name": os.path.basename(file_path) if file_path else None,
-        "file_size": os.path.getsize(file_path) if file_path and os.path.exists(file_path) else None,
-        "title": info.get("title"),
-    }
+def extract_first_url(text):
+    match = re.search(r'(https?://\S+)', text)
+    return match.group(1) if match else None
