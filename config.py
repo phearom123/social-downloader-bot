@@ -1,25 +1,16 @@
+# config.py
+
+# Replace with your actual Bot Token from BotFather
 BOT_TOKEN = "8466894355:AAHWyAtSeTYHjFbSezrwcDBMKk-hBhkMW5g"
 
-# Put your Telegram numeric ID(s)
+# Replace with your actual Telegram User ID (Get it from @userinfobot)
+# Example: ADMIN_IDS = [123456789]
 ADMIN_IDS = [5137640997]
 
-# Optional: send admin announcements to a channel/group/chat ID.
-# Leave None to send announcements to all admins.
-ADMIN_LOG_CHAT_ID = None
+# --- NEW SETTINGS FOR THE ENTERPRISE BOT ---
 
-# Downloads
-DOWNLOAD_DIR = "downloads"
-DB_PATH = "data/bot.db"
-MAX_DOWNLOADS_PER_DAY = 10
+# How many downloads a normal user gets per day before needing to refer a friend
+DAILY_DOWNLOAD_LIMIT = 10 
 
-# Force-join defaults (can be changed in admin dashboard)
-DEFAULT_FORCE_JOIN_ENABLED = False
-DEFAULT_FORCE_JOIN_MODE = "both"   # one of: channel, group, both
-DEFAULT_REQUIRED_CHANNEL = ""      # @channelusername or https://t.me/...
-DEFAULT_REQUIRED_GROUP = ""        # @groupusername or https://t.me/...
-DEFAULT_JOIN_MESSAGE_EN = "Please join the required channel/group before using this bot."
-DEFAULT_JOIN_MESSAGE_KH = "សូមចូល Channel/Group ដែលកំណត់ជាមុនសិន មុននឹងប្រើ bot នេះ។"
-
-# yt-dlp
-YTDLP_FORMAT = "bv*+ba/b"
-MAX_CAPTION_PREVIEW = 600
+# Maximum file size the bot will send directly to Telegram (50MB is Telegram's limit for standard bots)
+MAX_SEND_SIZE_BYTES = 50 * 1024 * 1024
