@@ -1,6 +1,0 @@
-pyTelegramBotAPI
-yt-dlp
-requests
-Flask
-curl_cffi
-schedule
