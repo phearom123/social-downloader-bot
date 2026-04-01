@@ -1,362 +1,397 @@
+import html
 import os
-import traceback
-from telebot import TeleBot
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from config import (
-    BOT_TOKEN, ADMIN_IDS, ADMIN_LOG_CHAT_ID, DOWNLOAD_DIR, DB_PATH,
-    MAX_DOWNLOADS_PER_DAY, DEFAULT_FORCE_JOIN_ENABLED, DEFAULT_FORCE_JOIN_MODE,
-    DEFAULT_REQUIRED_CHANNEL, DEFAULT_REQUIRED_GROUP,
-    DEFAULT_JOIN_MESSAGE_EN, DEFAULT_JOIN_MESSAGE_KH, YTDLP_FORMAT, MAX_CAPTION_PREVIEW
-)
-from texts import t
-from database import (
-    get_conn, init_db, ensure_default_settings, get_setting, set_setting, upsert_user, set_user_language,
-    get_user_language, mark_join_verified, add_download_log, count_user_downloads_today, get_stats,
-    get_recent_downloads, get_recent_users, search_user, get_user_downloads
-)
-from downloader import download_media, detect_platform
-from force_join import normalize_chat_ref, check_force_join, can_verify
-from admin import admin_menu, force_join_menu
+import threading
+import queue
+import time
+import schedule
+from datetime import datetime
+from typing import Optional
 
-bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
-conn = get_conn(DB_PATH)
-init_db(conn)
-ensure_default_settings(conn, {
-    "force_join_enabled": str(DEFAULT_FORCE_JOIN_ENABLED),
-    "force_join_mode": DEFAULT_FORCE_JOIN_MODE,
-    "required_channel": DEFAULT_REQUIRED_CHANNEL,
-    "required_group": DEFAULT_REQUIRED_GROUP,
-    "join_message_en": DEFAULT_JOIN_MESSAGE_EN,
-    "join_message_kh": DEFAULT_JOIN_MESSAGE_KH,
-})
+from flask import Flask
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-USER_STATE = {}
+# Local modules (Ensure these are updated to match the new DB requirements)
+from config import ADMIN_IDS, BOT_TOKEN, DAILY_DOWNLOAD_LIMIT, MAX_SEND_SIZE_BYTES
+from database import Database
+from downloader import SocialDownloader, DownloaderError, extract_first_url
+from force_join import check_force_join
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+    raise RuntimeError("Please set BOT_TOKEN in config.py")
 
-def admin_targets():
-    if ADMIN_LOG_CHAT_ID:
-        return [ADMIN_LOG_CHAT_ID]
-    return ADMIN_IDS
+# ==========================================
+# SYSTEM INITIALIZATION
+# ==========================================
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+db = Database()
+downloader = SocialDownloader()
 
-def notify_admins(text: str):
-    for chat_id in admin_targets():
+# Download Queue System to prevent freezing
+download_queue = queue.Queue()
+
+# Anti-spam tracker: {user_id: last_message_timestamp}
+user_spam_cache = {}
+SPAM_DELAY_SECONDS = 3
+
+# ==========================================
+# DUMMY WEB SERVER (FOR RENDER)
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Enterprise Bot is alive and running!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# ==========================================
+# FULL TRANSLATIONS (Khmer Default)
+# ==========================================
+LANG = {
+    "km": {
+        # User UI
+        "welcome": "👋 <b>សូមស្វាគមន៍មកកាន់ SaveKH Bot!</b> 🤖✨\n\nទាញយកវីដេអូ និងរូបភាពពីគ្រប់បណ្ដាញសង្គមដោយលឿន ឥតគិតថ្លៃ និងគ្មាន Watermark!\n\n📊 <b>កំណត់ប្រចាំថ្ងៃ៖</b> {used}/{total} ដង\n\n👇 សូមជ្រើសរើសជម្រើសខាងក្រោម៖",
+        "limit_reached": "🚫 <b>ដល់កំណត់ប្រចាំថ្ងៃហើយ! ({used}/{total})</b>\n\n🎁 <b>ទទួលបានការទាញយកបន្ថែម៖</b>\nណែនាំមិត្តភក្ដិ ១ នាក់ ទទួលបានការទាញយក +១ ជារៀងរហូត! ចែករំលែកតំណនេះ៖",
+        "ref_link_msg": "<code>{link}</code>",
+        "new_referral": "🎉 <b>អបអរសាទរ!</b>\nមានអ្នកចូលរួមតាមតំណរបស់អ្នក។ អ្នកទទួលបានការទាញយក +១ បន្ថែម!",
+        "invalid_link": "❌ សូមផ្ញើតំណភ្ជាប់បណ្ដាញសង្គមដែលត្រឹមត្រូវ (TikTok, FB, IG, YouTube...)។",
+        "unsupported_link": "⚠️ <b>មិនគាំទ្រ!</b>\nសុំទោស យើងមិនទាន់គាំទ្រគេហទំព័រនេះនៅឡើយទេ។",
+        "fetching_preview": "🔍 កំពុងទាញយកព័ត៌មានលម្អិត... សូមរង់ចាំ!",
+        "preview_text": "🎬 <b>ប្រភព៖</b> {platform}\n📁 <b>ប្រភេទ៖</b> {media_type}\n📝 <b>ចំណងជើង៖</b> {title}\n\n👇 តើអ្នកចង់ទាញយកមួយណា?",
+        "queue_added": "⏳ បានដាក់ចូលក្នុងបញ្ជីរង់ចាំ! ទីតាំងរបស់អ្នកគឺ៖ <b>#{pos}</b>",
+        "downloading": "⬇️ កំពុងដំណើរការទាញយក...",
+        "large_file": "✅ ទាញយកជោគជ័យ តែឯកសារធំជាង {limit}MB។\nរក្សាទុកជា៖ <code>{local_file}</code>",
+        "download_failed": "❌ ការទាញយកបរាជ័យ៖\n<code>{error}</code>",
+        "spam_warning": "⚠️ សូមរង់ចាំ {sec} វិនាទី មុនពេលផ្ញើសារម្ដងទៀត!",
+        "banned": "⛔️ គណនីរបស់អ្នកត្រូវបានបិទមិនឱ្យប្រើប្រាស់ Bot នេះទេ។",
+        "how_to_use": "🆘 <b>របៀបប្រើប្រាស់៖</b>\n១. ចូលទៅកាន់វីដេអូដែលអ្នកចង់បាន\n២. ចុច 'Copy Link' (ចម្លងតំណភ្ជាប់)\n៣. ផ្ញើតំណភ្ជាប់នោះមកទីនេះ\n៤. ជ្រើសរើសប្រភេទ (វីដេអូ, រូបភាព, សំឡេង)",
+        "my_usage": "📊 <b>ការប្រើប្រាស់របស់អ្នក៖</b>\n- ប្រើថ្ងៃនេះ៖ {used}/{total}\n- ទាញយកសរុប៖ {lifetime}\n- មិត្តដែលបានណែនាំ៖ {refs}",
+        "lang_changed": "✅ ភាសាត្រូវបានប្ដូរទៅជាភាសាខ្មែរ។",
+        
+        # Buttons
+        "btn_dl": "📥 ទាញយក",
+        "btn_how": "📘 របៀបប្រើ",
+        "btn_lang": "🌐 English",
+        "btn_usage": "📊 ការប្រើប្រាស់",
+        "btn_vid": "🎥 វីដេអូ",
+        "btn_img": "🖼 រូបភាព",
+        "btn_audio": "🎵 សំឡេង (Audio)",
+        "btn_cap": "📝 អត្ថបទ (Caption)",
+        "btn_cancel": "❌ បោះបង់",
+        
+        # Force Join
+        "fj_msg": "🔒 សូមចូលរួមឆានែលរបស់យើងសិន ដើម្បីអាចប្រើប្រាស់ Bot នេះបាន!",
+        "fj_verify": "✅ ខ្ញុំបានចូលរួមហើយ",
+        "fj_verified": "✅ ផ្ទៀងផ្ទាត់ជោគជ័យ! អ្នកអាចប្រើ Bot បានហើយ។",
+        "fj_missing": "❌ អ្នកមិនទាន់បានចូលរួមគ្រប់ឆានែលនៅឡើយទេ។",
+        
+        # Admin
+        "admin_title": "🛠 <b>ផ្ទាំងគ្រប់គ្រង (Admin Dashboard)</b>",
+        "admin_stats": "📊 ទិន្នន័យទូទៅ",
+        "admin_fj": "🔐 Force Join",
+        "admin_logs": "📥 ប្រវត្តិទាញយក",
+        "admin_users": "👤 សកម្មភាពអ្នកប្រើ",
+        "admin_search": "🔎 ស្វែងរក",
+        "admin_bans": "🚫 គ្រប់គ្រងបម្រាម (Bans)"
+    },
+    "en": {
+        "welcome": "👋 <b>Welcome to SaveKH Bot!</b> 🤖✨\n\nDownload videos & images fast, free, and without watermarks!\n\n📊 <b>Daily Limit:</b> {used}/{total}\n\n👇 Please choose an option:",
+        "limit_reached": "🚫 <b>Daily Limit Reached! ({used}/{total})</b>\n\n🎁 <b>Get more:</b>\nRefer 1 friend to get +1 daily limit forever! Share link:",
+        "ref_link_msg": "<code>{link}</code>",
+        "new_referral": "🎉 <b>Congrats!</b>\nSomeone joined using your link. You earned +1 bonus limit!",
+        "invalid_link": "❌ Please send a valid public social media link.",
+        "unsupported_link": "⚠️ <b>Unsupported!</b>\nSorry, we do not support this platform yet.",
+        "fetching_preview": "🔍 Fetching media details... please wait!",
+        "preview_text": "🎬 <b>Platform:</b> {platform}\n📁 <b>Type:</b> {media_type}\n📝 <b>Title:</b> {title}\n\n👇 What do you want to download?",
+        "queue_added": "⏳ Added to queue! Your position: <b>#{pos}</b>",
+        "downloading": "⬇️ Processing your download...",
+        "large_file": "✅ Downloaded, but file is larger than {limit}MB.\nSaved on server: <code>{local_file}</code>",
+        "download_failed": "❌ Download failed:\n<code>{error}</code>",
+        "spam_warning": "⚠️ Please wait {sec} seconds before sending another message!",
+        "banned": "⛔️ Your account is banned from using this bot.",
+        "how_to_use": "🆘 <b>How to use:</b>\n1. Find the video you want\n2. Click 'Copy Link'\n3. Paste the link here\n4. Choose Video, Image, or Audio",
+        "my_usage": "📊 <b>Your Usage:</b>\n- Used today: {used}/{total}\n- Lifetime DLs: {lifetime}\n- Friends referred: {refs}",
+        "lang_changed": "✅ Language changed to English.",
+        
+        "btn_dl": "📥 Download",
+        "btn_how": "📘 How to Use",
+        "btn_lang": "🌐 ភាសាខ្មែរ",
+        "btn_usage": "📊 My Usage",
+        "btn_vid": "🎥 Video",
+        "btn_img": "🖼 Image",
+        "btn_audio": "🎵 Audio Only",
+        "btn_cap": "📝 Caption",
+        "btn_cancel": "❌ Cancel",
+        
+        "fj_msg": "🔒 Please join our channels to use this bot!",
+        "fj_verify": "✅ I have joined",
+        "fj_verified": "✅ Verified! You can use the bot now.",
+        "fj_missing": "❌ You haven't joined all required channels.",
+        
+        "admin_title": "🛠 <b>Admin Dashboard</b>",
+        "admin_stats": "📊 Overall Stats",
+        "admin_fj": "🔐 Force Join",
+        "admin_logs": "📥 Download Logs",
+        "admin_users": "👤 User Activity",
+        "admin_search": "🔎 Search User",
+        "admin_bans": "🚫 Manage Bans"
+    }
+}
+
+def get_text(uid, key, **kwargs):
+    lang_code = db.get_user_lang(uid)
+    if lang_code not in LANG: lang_code = "km"
+    return LANG[lang_code].get(key, LANG["km"][key]).format(**kwargs)
+
+# ==========================================
+# UI BUILDERS
+# ==========================================
+def build_main_menu(uid):
+    lang = db.get_user_lang(uid)
+    toggle = "en" if lang == "km" else "km"
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        InlineKeyboardButton(get_text(uid, "btn_how"), callback_data="menu_how"),
+        InlineKeyboardButton(get_text(uid, "btn_usage"), callback_data="menu_usage")
+    )
+    markup.row(InlineKeyboardButton(get_text(uid, "btn_lang"), callback_data=f"setlang_{toggle}"))
+    return markup
+
+def build_preview_menu(uid, url, platform):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        InlineKeyboardButton(get_text(uid, "btn_vid"), callback_data=f"dl_vid_{url}"),
+        InlineKeyboardButton(get_text(uid, "btn_audio"), callback_data=f"dl_aud_{url}")
+    )
+    markup.row(
+        InlineKeyboardButton(get_text(uid, "btn_img"), callback_data=f"dl_img_{url}"),
+        InlineKeyboardButton(get_text(uid, "btn_cap"), callback_data=f"dl_cap_{url}")
+    )
+    markup.row(InlineKeyboardButton(get_text(uid, "btn_cancel"), callback_data="dl_cancel"))
+    return markup
+
+def build_admin_dashboard(uid):
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.row(InlineKeyboardButton(get_text(uid, "admin_stats"), callback_data="ad_stats"),
+               InlineKeyboardButton(get_text(uid, "admin_fj"), callback_data="ad_fj"))
+    markup.row(InlineKeyboardButton(get_text(uid, "admin_logs"), callback_data="ad_logs"),
+               InlineKeyboardButton(get_text(uid, "admin_users"), callback_data="ad_users"))
+    markup.row(InlineKeyboardButton(get_text(uid, "admin_search"), callback_data="ad_search"),
+               InlineKeyboardButton(get_text(uid, "admin_bans"), callback_data="ad_bans"))
+    return markup
+
+# ==========================================
+# BACKGROUND WORKERS & SCHEDULERS
+# ==========================================
+def process_download_queue():
+    """Worker thread that processes downloads one by one to prevent freezing"""
+    while True:
+        task = download_queue.get()
+        user_id, url, format_type, message_id, chat_id = task
+        
         try:
-            bot.send_message(chat_id, text)
-        except Exception:
-            pass
+            bot.edit_message_text(get_text(user_id, "downloading"), chat_id, message_id)
+            
+            # Execute download (Pass format_type to your downloader so it knows to grab video or audio)
+            result = downloader.download(url, user_id, format=format_type)
+            
+            # Save to database
+            dl_id = db.add_download(
+                telegram_id=user_id, username="", full_name="", source_url=url,
+                platform=result["platform"], media_type=format_type, caption_text=result["caption"],
+                local_file_name=result["local_file_name"], file_path=result["file_path"],
+                file_size=result["file_size"], status="done"
+            )
 
-def get_lang(user_id: int) -> str:
-    return get_user_language(conn, user_id, "en")
+            send_text = f"<b>{html.escape(result['platform'])}</b>\nID: <code>{dl_id}</code>\n\n{html.escape(result['caption'][:500])}"
 
-def set_lang(user_id: int, lang: str):
-    set_user_language(conn, user_id, lang)
+            # Auto-compress/Warning logic
+            if result["file_size"] > MAX_SEND_SIZE_BYTES:
+                bot.send_message(chat_id, get_text(user_id, "large_file", limit=MAX_SEND_SIZE_BYTES/1024/1024, local_file=result['local_file_name']))
+            else:
+                with open(result["file_path"], "rb") as f:
+                    if format_type == "video": bot.send_video(chat_id, f, caption=send_text)
+                    elif format_type == "audio": bot.send_audio(chat_id, f, caption=send_text)
+                    else: bot.send_photo(chat_id, f, caption=send_text)
 
-def main_menu(lang: str, user_id: int):
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton(t(lang, "menu_download")), KeyboardButton(t(lang, "menu_how")))
-    kb.row(KeyboardButton(t(lang, "menu_lang")), KeyboardButton(t(lang, "menu_stats")))
-    if is_admin(user_id):
-        kb.row(KeyboardButton(t(lang, "menu_admin")))
-    return kb
+            # Admin Notification
+            if db.get_setting("announce_downloads", "1") == "1":
+                bot.send_message(ADMIN_IDS[0], f"📥 ID {user_id} | Platform {result['platform']} | Status DONE")
+                
+            bot.delete_message(chat_id, message_id)
+            
+        except Exception as e:
+            db.add_download(telegram_id=user_id, source_url=url, platform="Unknown", status="failed", error_text=str(e))
+            bot.edit_message_text(get_text(user_id, "download_failed", error=str(e)), chat_id, message_id)
+            if db.get_setting("announce_downloads", "1") == "1":
+                bot.send_message(ADMIN_IDS[0], f"📥 ID {user_id} | Status FAILED | Err: {str(e)[:50]}")
+                
+        finally:
+            download_queue.task_done()
 
-def lang_menu():
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("English", callback_data="lang:en"),
-        InlineKeyboardButton("ខ្មែរ", callback_data="lang:kh")
-    )
-    return kb
+def daily_maintenance():
+    """Runs once a day to send summaries and clean files"""
+    # 1. Send Admin Summary
+    today_stats = db.get_today_stats() # Assumes this returns dict of counts
+    summary = f"📈 <b>Daily Summary</b>\nTotal DLs: {today_stats['total']}\nFailed: {today_stats['failed']}\nNew Users: {today_stats['new_users']}"
+    for admin in ADMIN_IDS:
+        try: bot.send_message(admin, summary)
+        except: pass
+        
+    # 2. Cleanup files older than 30 days
+    db.delete_old_files(days=30) 
 
-def force_join_buttons(lang: str):
-    m = InlineKeyboardMarkup(row_width=1)
-    req_channel = get_setting(conn, "required_channel", "") or ""
-    req_group = get_setting(conn, "required_group", "") or ""
-    if req_channel:
-        m.add(InlineKeyboardButton(t(lang, "join_channel"), url=req_channel if req_channel.startswith("http") else f"https://t.me/{req_channel.lstrip('@')}"))
-    if req_group:
-        m.add(InlineKeyboardButton(t(lang, "join_group"), url=req_group if req_group.startswith("http") else f"https://t.me/{req_group.lstrip('@')}"))
-    m.add(InlineKeyboardButton(t(lang, "recheck"), callback_data="force:recheck"))
-    return m
+def schedule_loop():
+    schedule.every().day.at("23:59").do(daily_maintenance)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
 
-def force_join_required(user_id: int):
-    enabled = str(get_setting(conn, "force_join_enabled", "False")).lower() == "true"
-    if not enabled:
+# ==========================================
+# MIDDLEWARE & HELPERS
+# ==========================================
+def check_spam(user_id):
+    now = time.time()
+    last = user_spam_cache.get(user_id, 0)
+    if now - last < SPAM_DELAY_SECONDS:
         return False
-    mode = get_setting(conn, "force_join_mode", "both")
-    channel_ref = normalize_chat_ref(get_setting(conn, "required_channel", "") or "")
-    group_ref = normalize_chat_ref(get_setting(conn, "required_group", "") or "")
-    return not check_force_join(bot, user_id, mode, channel_ref, group_ref)
+    user_spam_cache[user_id] = now
+    return True
 
-def send_force_join_prompt(chat_id: int, user_id: int):
-    lang = get_lang(user_id)
-    join_msg = get_setting(conn, f"join_message_{lang}", "") or t(lang, "force_join_title")
-    bot.send_message(chat_id, f"🔒 <b>{t(lang, 'force_join_title')}</b>\n\n{join_msg}", reply_markup=force_join_buttons(lang))
-
-def stats_text():
-    s = get_stats(conn)
-    return (
-        f"<b>Bot Stats</b>\n"
-        f"Total downloads: {s['total']}\n"
-        f"Today downloads: {s['today']}\n"
-        f"Videos only: {s['videos']}\n"
-        f"Images only: {s['images']}\n"
-        f"Captions only: {s['captions']}\n"
-        f"Failed downloads: {s['failed']}\n"
-        f"Users: {s['users']}"
-    )
-
-def user_usage_text(user_id: int, lang: str):
-    used = count_user_downloads_today(conn, user_id)
-    return f"<b>{t(lang, 'usage_title')}</b>\n{used}/{MAX_DOWNLOADS_PER_DAY}"
-
-def admin_force_join_text():
-    enabled = str(get_setting(conn, "force_join_enabled", "False")).lower() == "true"
-    mode = get_setting(conn, "force_join_mode", "both")
-    channel = get_setting(conn, "required_channel", "") or "-"
-    group = get_setting(conn, "required_group", "") or "-"
-    return (
-        f"<b>Force Join Settings</b>\n"
-        f"Status: {'ON' if enabled else 'OFF'}\n"
-        f"Mode: {mode}\n"
-        f"Channel: {channel}\n"
-        f"Group: {group}"
-    )
-
-def format_download_row(r):
-    return f"#{r['id']} | ID {r['telegram_id']} | {r['platform'] or '-'} | {r['media_type'] or '-'} | {r['status']}"
-
-def format_user_row(r):
-    return f"ID {r['telegram_id']} | @{r['username'] or '-'} | {r['full_name'] or '-'} | downloads={r['total_downloads'] or 0}"
-
+# ==========================================
+# COMMAND HANDLERS
+# ==========================================
 @bot.message_handler(commands=["start"])
-def start(message):
-    upsert_user(conn, message.from_user)
-    lang = get_lang(message.from_user.id)
-    bot.send_message(message.chat.id, t(lang, "welcome"), reply_markup=main_menu(lang, message.from_user.id))
+def start_cmd(message):
+    uid = message.from_user.id
+    if db.is_banned(uid): return bot.reply_to(message, get_text(uid, "banned"))
+    
+    # Handle Referrals
+    if len(message.text.split()) > 1:
+        payload = message.text.split()[1]
+        if payload.startswith("ref_"):
+            try:
+                referrer_id = int(payload.split("_")[1])
+                if referrer_id != uid and db.count_user_downloads_today(uid) == 0:
+                    db.add_bonus_download(referrer_id, 1)
+                    bot.send_message(referrer_id, get_text(referrer_id, "new_referral"))
+            except ValueError: pass
+
+    db.upsert_user(uid, message.from_user.username, message.from_user.first_name, message.from_user.last_name)
+    
+    used = db.count_user_downloads_today(uid)
+    total = DAILY_DOWNLOAD_LIMIT + db.get_bonus_downloads(uid)
+    
+    bot.reply_to(message, get_text(uid, "welcome", used=used, total=total), reply_markup=build_main_menu(uid))
 
 @bot.message_handler(commands=["admin"])
 def admin_cmd(message):
-    if not is_admin(message.from_user.id):
-        return bot.reply_to(message, t(get_lang(message.from_user.id), "admin_only"))
-    lang = get_lang(message.from_user.id)
-    bot.send_message(message.chat.id, f"<b>{t(lang, 'admin_title')}</b>\n\n{stats_text()}", reply_markup=admin_menu(lang))
+    if not is_admin(message.from_user.id, ADMIN_IDS): return
+    bot.reply_to(message, get_text(message.from_user.id, "admin_title"), reply_markup=build_admin_dashboard(message.from_user.id))
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("lang:"))
-def on_lang(call):
-    lang = call.data.split(":")[1]
-    set_lang(call.from_user.id, lang)
-    bot.answer_callback_query(call.id, "OK")
-    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-    bot.send_message(call.message.chat.id, t(lang, "lang_set_en") if lang=="en" else t(lang, "lang_set_kh"), reply_markup=main_menu(lang, call.from_user.id))
-
-@bot.callback_query_handler(func=lambda c: c.data == "force:recheck")
-def recheck_join(call):
-    upsert_user(conn, call.from_user)
-    lang = get_lang(call.from_user.id)
-    if force_join_required(call.from_user.id):
-        bot.answer_callback_query(call.id, t(lang, "blocked"), show_alert=True)
-        return
-    mark_join_verified(conn, call.from_user.id)
-    notify_admins(f"✅ Join verified | ID {call.from_user.id}")
-    bot.answer_callback_query(call.id, "OK", show_alert=False)
-    bot.send_message(call.message.chat.id, "✅ Verified.", reply_markup=main_menu(lang, call.from_user.id))
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("admin:"))
-def on_admin_cb(call):
-    if not is_admin(call.from_user.id):
-        return bot.answer_callback_query(call.id, "Admin only", show_alert=True)
-    lang = get_lang(call.from_user.id)
-    enabled = str(get_setting(conn, "force_join_enabled", "False")).lower() == "true"
-    mode = get_setting(conn, "force_join_mode", "both")
-    data = call.data
-
-    if data == "admin:home":
-        bot.edit_message_text(f"<b>{t(lang, 'admin_title')}</b>\n\n{stats_text()}",
-                              call.message.chat.id, call.message.message_id, reply_markup=admin_menu(lang))
-    elif data == "admin:forcejoin":
-        bot.edit_message_text(admin_force_join_text(), call.message.chat.id, call.message.message_id,
-                              reply_markup=force_join_menu(lang, enabled, mode))
-    elif data == "admin:toggle_forcejoin":
-        set_setting(conn, "force_join_enabled", str(not enabled))
-        enabled = not enabled
-        bot.edit_message_text(admin_force_join_text(), call.message.chat.id, call.message.message_id,
-                              reply_markup=force_join_menu(lang, enabled, mode))
-    elif data == "admin:cycle_mode":
-        modes = ["channel", "group", "both"]
-        mode = modes[(modes.index(mode) + 1) % len(modes)] if mode in modes else "both"
-        set_setting(conn, "force_join_mode", mode)
-        bot.edit_message_text(admin_force_join_text(), call.message.chat.id, call.message.message_id,
-                              reply_markup=force_join_menu(lang, enabled, mode))
-    elif data == "admin:set_channel":
-        USER_STATE[call.from_user.id] = {"action": "set_channel"}
-        bot.send_message(call.message.chat.id, t(lang, "admin_send_channel"))
-    elif data == "admin:set_group":
-        USER_STATE[call.from_user.id] = {"action": "set_group"}
-        bot.send_message(call.message.chat.id, t(lang, "admin_send_group"))
-    elif data == "admin:set_join_msg":
-        USER_STATE[call.from_user.id] = {"action": "set_join_msg", "lang": lang}
-        bot.send_message(call.message.chat.id, t(lang, "admin_send_join_msg"))
-    elif data == "admin:logs":
-        rows = get_recent_downloads(conn, 15)
-        txt = "<b>Latest Downloads</b>\n" + ("\n".join(format_download_row(r) for r in rows) if rows else "-")
-        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
-                              reply_markup=InlineKeyboardMarkup().add(
-                                  InlineKeyboardButton("🎬 Videos", callback_data="admin:logs_video"),
-                                  InlineKeyboardButton("🖼 Images", callback_data="admin:logs_image"),
-                                  InlineKeyboardButton(t(lang, "admin_back"), callback_data="admin:home")
-                              ))
-    elif data == "admin:logs_video":
-        rows = get_recent_downloads(conn, 15, media_type="video")
-        txt = "<b>Latest Videos</b>\n" + ("\n".join(format_download_row(r) for r in rows) if rows else "-")
-        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
-                              reply_markup=InlineKeyboardMarkup().add(
-                                  InlineKeyboardButton(t(lang, "admin_back"), callback_data="admin:logs")
-                              ))
-    elif data == "admin:logs_image":
-        rows = get_recent_downloads(conn, 15, media_type="image")
-        txt = "<b>Latest Images</b>\n" + ("\n".join(format_download_row(r) for r in rows) if rows else "-")
-        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
-                              reply_markup=InlineKeyboardMarkup().add(
-                                  InlineKeyboardButton(t(lang, "admin_back"), callback_data="admin:logs")
-                              ))
-    elif data == "admin:users":
-        rows = get_recent_users(conn, 15)
-        txt = "<b>Recent Users</b>\n" + ("\n".join(format_user_row(r) for r in rows) if rows else "-")
-        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
-                              reply_markup=InlineKeyboardMarkup().add(
-                                  InlineKeyboardButton(t(lang, "admin_back"), callback_data="admin:home")
-                              ))
-    elif data == "admin:search":
-        USER_STATE[call.from_user.id] = {"action": "search_user"}
-        bot.send_message(call.message.chat.id, t(lang, "admin_send_search"))
-    bot.answer_callback_query(call.id)
-
+# ==========================================
+# MAIN LINK HANDLER
+# ==========================================
 @bot.message_handler(func=lambda m: True, content_types=["text"])
-def on_text(message):
-    upsert_user(conn, message.from_user)
-    user_id = message.from_user.id
-    lang = get_lang(user_id)
-    text = (message.text or "").strip()
+def handle_link(message):
+    uid = message.from_user.id
+    if db.is_banned(uid): return
+    
+    if not check_spam(uid):
+        return bot.reply_to(message, get_text(uid, "spam_warning", sec=SPAM_DELAY_SECONDS))
 
-    # pending admin actions
-    state = USER_STATE.get(user_id)
-    if state and is_admin(user_id):
-        action = state.get("action")
-        if action == "set_channel":
-            set_setting(conn, "required_channel", text)
-            USER_STATE.pop(user_id, None)
-            return bot.send_message(message.chat.id, t(lang, "saved"))
-        elif action == "set_group":
-            set_setting(conn, "required_group", text)
-            USER_STATE.pop(user_id, None)
-            return bot.send_message(message.chat.id, t(lang, "saved"))
-        elif action == "set_join_msg":
-            set_setting(conn, f"join_message_{state.get('lang','en')}", text)
-            USER_STATE.pop(user_id, None)
-            return bot.send_message(message.chat.id, t(lang, "saved"))
-        elif action == "search_user":
-            USER_STATE.pop(user_id, None)
-            rows = search_user(conn, text)
-            if not rows:
-                return bot.send_message(message.chat.id, t(lang, "not_found"))
-            parts = []
-            for r in rows[:10]:
-                parts.append(format_user_row(r))
-                dls = get_user_downloads(conn, r["telegram_id"], 5)
-                if dls:
-                    parts.extend([f"  - {format_download_row(d)}" for d in dls])
-            return bot.send_message(message.chat.id, "<b>Search Results</b>\n" + "\n".join(parts))
+    url = extract_first_url(message.text)
+    if not url: return 
 
-    # menu actions
-    if text in {t(lang, "menu_download"), "📥 Download", "📥 ទាញយក"}:
-        return bot.send_message(message.chat.id, t(lang, "ask_link"))
-    if text in {t(lang, "menu_how"), "📘 How to Use", "📘 របៀបប្រើ"}:
-        return bot.send_message(message.chat.id, t(lang, "how_to"), reply_markup=main_menu(lang, user_id))
-    if text in {t(lang, "menu_lang"), "🌐 Language", "🌐 ភាសា"}:
-        return bot.send_message(message.chat.id, "Choose language / ជ្រើសរើសភាសា", reply_markup=lang_menu())
-    if text in {t(lang, "menu_stats"), "📊 My Usage", "📊 ការប្រើប្រាស់របស់ខ្ញុំ"}:
-        return bot.send_message(message.chat.id, user_usage_text(user_id, lang), reply_markup=main_menu(lang, user_id))
-    if text in {t(lang, "menu_admin"), "🛠 Admin Dashboard", "🛠 ផ្ទាំងគ្រប់គ្រង"}:
-        if not is_admin(user_id):
-            return bot.send_message(message.chat.id, t(lang, "admin_only"))
-        return bot.send_message(message.chat.id, f"<b>{t(lang, 'admin_title')}</b>\n\n{stats_text()}",
-                                reply_markup=admin_menu(lang))
+    # Supported Platform Check
+    if not downloader.is_supported(url):
+        return bot.reply_to(message, get_text(uid, "unsupported_link"))
 
-    # treat as URL
-    if text.startswith("http://") or text.startswith("https://"):
-        if force_join_required(user_id):
-            send_force_join_prompt(message.chat.id, user_id)
-            return
-        used = count_user_downloads_today(conn, user_id)
-        if used >= MAX_DOWNLOADS_PER_DAY:
-            return bot.send_message(message.chat.id, t(lang, "limit_reached", limit=MAX_DOWNLOADS_PER_DAY))
-        msg = bot.send_message(message.chat.id, t(lang, "checking"))
-        user_dir = os.path.join(DOWNLOAD_DIR, str(user_id))
-        os.makedirs(user_dir, exist_ok=True)
-        try:
-            result = download_media(text, user_dir, YTDLP_FORMAT)
-            file_path = result.get("file_path")
-            platform = result.get("platform") or detect_platform(text)
-            media_type = result.get("media_type") or "video"
-            caption = (result.get("caption") or "").strip()
-            preview = caption[:MAX_CAPTION_PREVIEW]
-            if file_path and os.path.exists(file_path):
-                with open(file_path, "rb") as f:
-                    if media_type == "image":
-                        bot.send_photo(message.chat.id, f, caption=(preview or t(lang, "download_done")))
-                    else:
-                        bot.send_video(message.chat.id, f, caption=(preview or t(lang, "download_done")))
-                add_download_log(conn, {
-                    "telegram_id": user_id,
-                    "username": message.from_user.username,
-                    "full_name": (message.from_user.first_name or "") + (" " + message.from_user.last_name if message.from_user.last_name else ""),
-                    "source_url": text,
-                    "platform": platform,
-                    "media_type": media_type,
-                    "caption": caption,
-                    "local_file_name": result.get("local_file_name"),
-                    "file_path": file_path,
-                    "file_size": result.get("file_size"),
-                    "status": "DONE",
-                    "error_message": None,
-                })
-                notify_admins(f"📥 ID {user_id} | Platform {platform} | Status DONE")
-                try:
-                    bot.delete_message(message.chat.id, msg.message_id)
-                except Exception:
-                    pass
-            else:
-                raise RuntimeError("Downloaded file not found.")
-        except Exception as e:
-            add_download_log(conn, {
-                "telegram_id": user_id,
-                "username": message.from_user.username,
-                "full_name": (message.from_user.first_name or "") + (" " + message.from_user.last_name if message.from_user.last_name else ""),
-                "source_url": text,
-                "platform": detect_platform(text),
-                "media_type": "video",
-                "caption": None,
-                "local_file_name": None,
-                "file_path": None,
-                "file_size": None,
-                "status": "FAILED",
-                "error_message": str(e),
-            })
-            notify_admins(f"📥 ID {user_id} | Platform {detect_platform(text)} | Status FAILED")
-            try:
-                bot.edit_message_text(t(lang, "download_failed"), message.chat.id, msg.message_id)
-            except Exception:
-                bot.send_message(message.chat.id, t(lang, "download_failed"))
-            print("ERROR:", e)
-            traceback.print_exc()
-        return
+    # Force Join Check
+    ok, missing = check_force_join(bot, db, uid)
+    if not ok:
+        msg = db.get_setting("force_join_message", get_text(uid, "fj_msg"))
+        # Using build_force_join_menu from your previous code
+        return bot.reply_to(message, msg) # Add reply_markup=build_force_join_menu(db)
 
-    bot.send_message(message.chat.id, t(lang, "welcome"), reply_markup=main_menu(lang, user_id))
+    # Limit Check
+    used = db.count_user_downloads_today(uid)
+    total = DAILY_DOWNLOAD_LIMIT + db.get_bonus_downloads(uid)
+    if used >= total:
+        ref_link = f"https://t.me/{bot.get_me().username}?start=ref_{uid}"
+        return bot.reply_to(message, f"{get_text(uid, 'limit_reached', used=used, total=total)}\n\n{get_text(uid, 'ref_link_msg', link=ref_link)}")
 
+    # Fetch Preview
+    wait_msg = bot.reply_to(message, get_text(uid, "fetching_preview"))
+    try:
+        # Assumes downloader.get_info() extracts metadata quickly without downloading
+        info = downloader.get_info(url) 
+        preview = get_text(uid, "preview_text", platform=info['platform'], media_type="Video/Audio", title=html.escape(info['title'][:50]))
+        bot.edit_message_text(preview, message.chat.id, wait_msg.message_id, reply_markup=build_preview_menu(uid, url, info['platform']))
+    except Exception as e:
+        bot.edit_message_text(get_text(uid, "download_failed", error=str(e)), message.chat.id, wait_msg.message_id)
+
+# ==========================================
+# CALLBACK HANDLERS
+# ==========================================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("dl_"))
+def process_download_choice(call):
+    uid = call.from_user.id
+    action = call.data.split("_")[1]
+    
+    if action == "cancel":
+        return bot.delete_message(call.message.chat.id, call.message.message_id)
+        
+    url = call.data.replace(f"dl_{action}_", "")
+    format_type = "video" if action == "vid" else "audio" if action == "aud" else "image"
+    
+    # Queue the task
+    pos = download_queue.qsize() + 1
+    bot.edit_message_text(get_text(uid, "queue_added", pos=pos), call.message.chat.id, call.message.message_id)
+    
+    download_queue.put((uid, url, format_type, call.message.message_id, call.message.chat.id))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("menu_") or call.data.startswith("setlang_"))
+def user_menus(call):
+    uid = call.from_user.id
+    if call.data.startswith("setlang_"):
+        new_lang = call.data.split("_")[1]
+        db.set_user_lang(uid, new_lang)
+        bot.answer_callback_query(call.id, get_text(uid, "lang_changed"))
+        # Refresh menu
+        used = db.count_user_downloads_today(uid)
+        total = DAILY_DOWNLOAD_LIMIT + db.get_bonus_downloads(uid)
+        bot.edit_message_text(get_text(uid, "welcome", used=used, total=total), call.message.chat.id, call.message.message_id, reply_markup=build_main_menu(uid))
+        
+    elif call.data == "menu_how":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, get_text(uid, "how_to_use"))
+        
+    elif call.data == "menu_usage":
+        bot.answer_callback_query(call.id)
+        used = db.count_user_downloads_today(uid)
+        total = DAILY_DOWNLOAD_LIMIT + db.get_bonus_downloads(uid)
+        lifetime = db.get_lifetime_downloads(uid)
+        refs = db.get_bonus_downloads(uid) # assuming 1 ref = 1 bonus
+        bot.send_message(call.message.chat.id, get_text(uid, "my_usage", used=used, total=total, lifetime=lifetime, refs=refs))
+
+# ==========================================
+# START APPLICATION
+# ==========================================
 if __name__ == "__main__":
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    print("Bot is running...")
+    print("Starting Background Workers...")
+    
+    # Start Web Server (For Render)
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    # Start Queue Worker
+    threading.Thread(target=process_download_queue, daemon=True).start()
+    
+    # Start Maintenance Scheduler
+    threading.Thread(target=schedule_loop, daemon=True).start()
+    
+    print("Bot is running with full Queue, Previews, and Admin Systems...")
     bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
